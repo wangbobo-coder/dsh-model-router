@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Model Router">
+  <defs>
+    <linearGradient id="mr-line" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4D6BFE"/>
+      <stop offset="1" stop-color="#12B8A6"/>
+    </linearGradient>
+    <linearGradient id="mr-node" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E8EEFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="#0F1B33"/>
+
+  <!-- three branches: local (left), router hub (center), cloud (right) -->
+  <path d="M18 20 L32 32 M18 44 L32 32 M46 20 L32 32 M46 44 L32 32"
+        stroke="url(#mr-line)" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+
+  <!-- hub -->
+  <circle cx="32" cy="32" r="8.5" fill="url(#mr-node)"/>
+  <circle cx="32" cy="32" r="3.2" fill="#4D6BFE"/>
+
+  <!-- local endpoints (monitor-ish) -->
+  <rect x="6" y="14" width="14" height="11" rx="2.6" fill="none" stroke="#7C8DB5" stroke-width="2.4"/>
+  <path d="M13 25 v3" stroke="#7C8DB5" stroke-width="2.4" stroke-linecap="round"/>
+
+  <rect x="6" y="39" width="14" height="11" rx="2.6" fill="none" stroke="#7C8DB5" stroke-width="2.4"/>
+  <path d="M13 39 v-3" stroke="#7C8DB5" stroke-width="2.4" stroke-linecap="round"/>
+
+  <!-- cloud endpoints (cloud-shaped) -->
+  <path d="M45 22 a5 5 0 0 1 9.2-1.6 A4 4 0 0 1 55 27.8 H45.4 A3.6 3.6 0 0 1 45 22 Z"
+        fill="none" stroke="#12B8A6" stroke-width="2.4" stroke-linejoin="round"/>
+  <path d="M45 47 a5 5 0 0 1 9.2-1.6 A4 4 0 0 1 55 52.8 H45.4 A3.6 3.6 0 0 1 45 47 Z"
+        fill="none" stroke="#12B8A6" stroke-width="2.4" stroke-linejoin="round"/>
+</svg>

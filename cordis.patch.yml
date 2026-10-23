@@ -1,0 +1,83 @@
+# dsh-model-router bundle patch.
+#
+# Inserts one Host plugin row. Everything tunable lives in its `config:` block —
+# edit this file (or the plugin's settings entry) rather than the source.
+# The row is id-addressable as `model-router` from a later patch layer.
+#
+# 2026-10-23: this row is force-disabled in the profile's cordis.patch.yml
+# (`- id: model-router` / `disabled: true`) because DSH's web_search/web_fetch
+# are host-side tools that work with the local model, so routing is not needed
+# for research. Keep the code; re-enable only if you want cloud-model quality
+# upgrades or cost control.
+- insert:
+    - id: model-router
+      name: '@local/dsh-model-router'
+      config:
+        enabled: true
+        # auto = 按意图自动判定；local / cloud = 全部强制走某一边
+        mode: auto
+        # 本地路由：留空 = 不干预，沿用你在 UI 里选中的模型
+        localProvider: ''
+        localModel: ''
+        # 云端路由：auto = 自动从已注册路由里挑 deepseek-account / deepseek-official
+        cloudProvider: auto
+        # 官方目录里带 1017 徽标的 DeepSeek-V4.1-Flash（provider deepseek-account）
+        cloudModel: deepseek-flash
+        # 切到云端时是否沿用 temperature / maxTokens / reasoningEffort
+        keepControlsOnSwitch: false
+        # 云端失败（未登录 / 无凭据 / 配额）后降级回本地并冷却
+        fallbackToLocalOnCloudFailure: true
+        cloudCooldownMs: 600000
+        # 云端黏住多少个 turn
+        stickyTurns: 1
+        logRouting: true
+        # 命中即判定「这一轮需要联网」
+        researchKeywords:
+          - 联网
+          - 上网
+          - 搜索
+          - 搜一下
+          - 查一下
+          - 查询
+          - 检索
+          - 调研
+          - 研究一下
+          - 最新
+          - 近期
+          - 新闻
+          - 资讯
+          - 官网
+          - 文档链接
+          - 网址
+          - 引用来源
+          - 出处
+          - 研究报告
+          - 评测
+          - 对比一下
+          - 实时
+          - search
+          - web search
+          - look up
+          - lookup
+          - research
+          - browse
+          - crawl
+          - latest
+          - recent
+          - news
+          - release notes
+          - changelog
+          - official docs
+          - google
+          - bing
+          - duckduckgo
+          - arxiv
+          - github issue
+          - stackoverflow
+        # 本 turn 调用过这些工具就留在云端（支持结尾 * 通配）
+        researchTools:
+          - web_search
+          - web_fetch
+          - x_search
+          - read_page
+          - mcp__*

@@ -1,0 +1,53 @@
+{
+  "name": "@local/dsh-model-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Auto-route each model request between a local model route and the official DeepSeek cloud route, so research/web-search turns go to the cloud while ordinary development stays local. / 自动在本地模型与 DeepSeek 官方云端模型之间路由每次请求：需要联网搜索/调研时自动走云端，日常开发留在本地。",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "model-routing",
+    "router",
+    "llm",
+    "local-model",
+    "web-search"
+  ]
+}

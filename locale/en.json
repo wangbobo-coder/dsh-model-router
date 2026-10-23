@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Model Router",
+    "description": "Automatically routes each request between a local model and the DeepSeek cloud model, so research turns use cloud web search while ordinary development stays local."
+  }
+}
