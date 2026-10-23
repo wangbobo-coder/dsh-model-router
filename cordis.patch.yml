@@ -4,11 +4,11 @@
 # edit this file (or the plugin's settings entry) rather than the source.
 # The row is id-addressable as `model-router` from a later patch layer.
 #
-# 2026-10-23: this row is force-disabled in the profile's cordis.patch.yml
-# (`- id: model-router` / `disabled: true`) because DSH's web_search/web_fetch
-# are host-side tools that work with the local model, so routing is not needed
-# for research. Keep the code; re-enable only if you want cloud-model quality
-# upgrades or cost control.
+# 2026-10-23: this row is disabled in the profile's cordis.patch.yml
+# (`- id: model-router` / `disabled: true`). DSH's web_search/web_fetch are
+# host-side tools that already work with the local model, so routing is not
+# required for research. Keep the code; re-enable if you want cloud-model
+# quality upgrades, cost control, or subagent-based research.
 - insert:
     - id: model-router
       name: '@local/dsh-model-router'
@@ -30,6 +30,17 @@
         cloudCooldownMs: 600000
         # 云端黏住多少个 turn
         stickyTurns: 1
+        # 调研执行方式：subagent = 开云端子智能体去查，主会话留本地；
+        # inline = 主会话自己切到云端
+        researchMode: subagent
+        # 子智能体 provider，取自已注册的 provider（spawn = 本进程内跑）
+        researchSubagentProvider: spawn
+        # 子智能体超时（毫秒）：超时放弃本次调研，主会话照常本地继续
+        researchTimeoutMs: 180000
+        # 子智能体可再往下委派的最大深度（1 = 不允许孙智能体）
+        researchMaxDepth: 1
+        # 自定义子智能体提示词，{question} 替换成请求原文；留空用内置模板
+        researchPrompt: ''
         logRouting: true
         # 命中即判定「这一轮需要联网」
         researchKeywords:

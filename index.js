@@ -148,6 +148,34 @@ export const Config = z.object({
       .description('本 turn 调用过这些工具（支持结尾 * 通配）就留在云端。')
   ),
 
+  researchMode: vol(
+    z
+      .union([z.const('inline'), z.const('subagent')])
+      .default('subagent')
+      .description(
+        'subagent = 调研轮次开一个云端子智能体去查，主会话留在本地（默认）；inline = 主会话自己切到云端。'
+      )
+  ),
+
+  researchSubagentProvider: vol(
+    z.string().default('spawn').description('子智能体 provider 名，取自 ctx.subagents.list()。')
+  ),
+
+  researchTimeoutMs: vol(
+    z.number().default(180000).description('子智能体调研超时（毫秒）。超时则放弃本次调研，主会话照常本地继续。')
+  ),
+
+  researchMaxDepth: vol(
+    z.number().default(1).description('子智能体可再往下委派的最大深度（1 = 不允许孙智能体）。')
+  ),
+
+  researchPrompt: vol(
+    z
+      .string()
+      .default('')
+      .description('子智能体任务提示词模板，{question} 会替换成当前请求原文。留空用内置模板。')
+  ),
+
   stickyTurns: vol(
     z.number().default(1).description('切到云端后黏住多少个 turn（1 = 仅当前 turn）。')
   ),
@@ -186,8 +214,21 @@ export function apply(ctx, config) {
   const pending = new Map();
   /** sessionId -> turn：云端黏住到哪个 turn 为止。 */
   const stuck = new Map();
+  /** sessionId 集合：正在跑子智能体调研，期间不再重复外包。 */
+  const inflight = new Set();
 
-  const stats = { requests: 0, routedCloud: 0, routedLocal: 0, cloudFailures: 0, lastRoute: undefined, lastReason: undefined };
+  const stats = {
+    requests: 0,
+    routedCloud: 0,
+    routedLocal: 0,
+    cloudFailures: 0,
+    researchSpawns: 0,
+    researchOk: 0,
+    researchFailed: 0,
+    researchEmpty: 0,
+    lastRoute: undefined,
+    lastReason: undefined
+  };
 
   /** 最近若干次路由决策，供 model_router status 展示，便于确认「这一轮到底走了哪边」。 */
   const recent = [];
@@ -258,18 +299,142 @@ export function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next();
     try {
-      if (cfg.enabled && decision && decision.kind === 'enter') {
-        const sid = String(payload.agent && payload.agent.id ? payload.agent.id : 'global');
-        // 优先用真正要进入这一步的 messages；有些决策不携带 messages，则回退到 payload。
-        const entering = Array.isArray(decision.messages) && decision.messages.length ? decision.messages : payload.messages;
-        const verdict = classify(messagesText(entering), cfg, pinnedFor(sid));
-        if (verdict) pending.set(sid, { route: verdict.route, turn: payload.turn, reason: verdict.reason });
-      }
+      if (!cfg.enabled || !decision || decision.kind !== 'enter') return decision;
+
+      const sid = String(payload.agent && payload.agent.id ? payload.agent.id : 'global');
+      // 优先用真正要进入这一步的 messages；有些决策不携带 messages，则回退到 payload。
+      const entering = Array.isArray(decision.messages) && decision.messages.length ? decision.messages : payload.messages;
+      const text = messagesText(entering);
+      const verdict = classify(text, cfg, pinnedFor(sid));
+
+      if (!verdict) return decision;
+
+      // 子智能体调研模式：把「调研」这件事外包出去，主会话原地不动。
+      const handled = await maybeDelegateResearch(payload, decision, sid, text, verdict);
+      if (handled) return handled;
+
+      pending.set(sid, { route: verdict.route, turn: payload.turn, reason: verdict.reason });
     } catch (err) {
       log('pre-step 判定失败，放行:', err && err.message);
     }
     return decision;
   });
+
+  /**
+   * 调研轮次外包给云端子智能体。
+   *
+   * 命中条件（全部满足才外包，否则返回 undefined 走原来的 inline 路由）：
+   * - `researchMode === 'subagent'`
+   * - 判定结果是云端（本地轮次没有外包的意义）
+   * - 不是人工钉住（用户明确要求主会话走云端时尊重其意图）
+   * - 只在 turn 的第一步触发，避免同一步骤重复开子智能体
+   * - 当前会话是顶层会话：子智能体自己也会发请求，不设防会无限套娃
+   * - 云端路由可用且不在冷却期
+   *
+   * 成功时返回一份新的 decision：调研结论作为插件消息并入本步输入，
+   * 主会话仍用本地模型继续。失败时返回 undefined，退回 inline 路由。
+   */
+  async function maybeDelegateResearch(payload, decision, sid, text, verdict) {
+    if (cfg.researchMode !== 'subagent') return undefined;
+    if (verdict.route !== CLOUD) return undefined;
+    if (verdict.reason === 'manual-pin') return undefined;
+    // pre-step 的 step 从 1 起算（phase.step + 1），只在 turn 的第一步外包。
+    if (payload.step !== 1) return undefined;
+    if (!text || !text.trim()) return undefined;
+    if (isChildSession(payload.agent)) return undefined;
+    if (inflight.has(sid)) return undefined;
+    if (cooldownUntil > Date.now()) return undefined;
+
+    const subagents = typeof ctx.get === 'function' ? ctx.get('subagents') : undefined;
+    if (!subagents || typeof subagents.start !== 'function') {
+      log('subagents 服务不可用，退回主会话 inline 路由');
+      return undefined;
+    }
+    const provider = cfg.researchSubagentProvider;
+    try {
+      if (typeof subagents.list === 'function' && !subagents.list().includes(provider)) {
+        log(`子智能体 provider "${provider}" 未注册，已注册:`, subagents.list().join(', ') || '(none)');
+        return undefined;
+      }
+    } catch (err) {
+      log('subagents.list() 失败:', err && err.message);
+    }
+
+    const target = await resolveCloudTarget(false);
+    if (!target) return undefined;
+
+    inflight.add(sid);
+    stats.researchSpawns += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), cfg.researchTimeoutMs);
+    const onAbort = () => controller.abort();
+    try {
+      if (payload.signal && typeof payload.signal.addEventListener === 'function') {
+        if (payload.signal.aborted) return undefined;
+        payload.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      log(`turn ${payload.turn}: 调研外包给子智能体 ${provider} (${target.provider}/${target.model})`);
+      const run = await subagents.start(provider, {
+        label: `调研：${firstLine(text, 40)}`,
+        prompt: [{ type: 'text', text: buildResearchPrompt(text, cfg.researchPrompt) }],
+        parent: payload.agent,
+        signal: controller.signal,
+        agentOptions: { provider: target.provider, model: target.model },
+        maxDepth: cfg.researchMaxDepth
+      });
+
+      let result;
+      try {
+        result = await run.result;
+      } finally {
+        try {
+          await run.dispose();
+        } catch (err) {
+          log('子智能体 dispose 失败:', err && err.message);
+        }
+      }
+
+      const answer = contentToText(result && result.output);
+      const stopReason = (result && result.stopReason) || 'unknown';
+
+      if (!answer.trim()) {
+        stats.researchEmpty += 1;
+        log(`turn ${payload.turn}: 子智能体未产出内容 (stopReason=${stopReason})，退回 inline 路由`);
+        return undefined;
+      }
+
+      stats.researchOk += 1;
+      record({
+        turn: payload.turn,
+        step: payload.step,
+        route: LOCAL,
+        reason: `research-subagent:${stopReason}`,
+        model: `${target.provider}/${target.model} → 子智能体`
+      });
+
+      // 主会话保持本地：清掉可能残留的云端黏住，并按本地处理本次请求。
+      stuck.delete(sid);
+      pending.set(sid, { route: LOCAL, turn: payload.turn, reason: 'research-subagent' });
+
+      return {
+        ...decision,
+        messages: [...decision.messages, buildResearchMessage(text, answer, target, stopReason)]
+      };
+    } catch (err) {
+      stats.researchFailed += 1;
+      const aborted = controller.signal.aborted;
+      log(`turn ${payload.turn}: 子智能体调研${aborted ? '超时' : '失败'}：${err && err.message}`);
+      // 外包失败不阻断对话：退回 inline 路由，让主会话自己判断要不要查。
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+      if (payload.signal && typeof payload.signal.removeEventListener === 'function') {
+        payload.signal.removeEventListener('abort', onAbort);
+      }
+      inflight.delete(sid);
+    }
+  }
 
   // ── 真正的路由 ───────────────────────────────────────────────────────────
   ctx.on('agent/request', async (payload, next) => {
@@ -397,6 +562,9 @@ export function apply(ctx, config) {
             route: { type: 'string' },
             local: { type: 'object' },
             cloud: { type: 'object' },
+            researchMode: { type: 'string' },
+            researchSubagentProvider: { type: 'string' },
+            subagents: { type: 'array', items: { type: 'string' } },
             stats: { type: 'object' },
             note: { type: 'string' }
           },
@@ -578,6 +746,7 @@ export function apply(ctx, config) {
       defaults: Config({}),
       providers,
       models,
+      subagents: subagentNames(ctx, log),
       cloudTarget: cloudTarget ?? null,
       cooldown: Math.max(0, cooldownUntil - Date.now()),
       managed: Boolean(findEntry()),
@@ -598,6 +767,9 @@ export function apply(ctx, config) {
       cloud: cloudTarget ? { provider: cloudTarget.provider, model: cloudTarget.model } : { provider: '(未解析)', model: '(未解析)' },
       coolingDown: cooldownUntil > Date.now(),
       stickyTurns: cfg.stickyTurns,
+      researchMode: cfg.researchMode,
+      researchSubagentProvider: cfg.researchSubagentProvider,
+      subagents: subagentNames(ctx, log),
       researchKeywordCount: cfg.researchKeywords.length,
       researchToolCount: cfg.researchTools.length,
       stats: { ...stats },
@@ -621,11 +793,25 @@ export function apply(ctx, config) {
     overrides.clear();
     pending.clear();
     stuck.clear();
+    inflight.clear();
     recent.length = 0;
   };
 }
 
 // ── 纯函数（导出以便单测） ────────────────────────────────────────────────
+
+/** 读取已注册的子智能体 provider 名；服务缺失时返回空数组。 */
+function subagentNames(ctx, log) {
+  try {
+    const subagents = typeof ctx.get === 'function' ? ctx.get('subagents') : undefined;
+    if (!subagents || typeof subagents.list !== 'function') return [];
+    const list = subagents.list();
+    return Array.isArray(list) ? list.map(String) : [];
+  } catch (err) {
+    if (typeof log === 'function') log('subagents.list() 失败:', err && err.message);
+    return [];
+  }
+}
 
 /** 只接受本机 Host，且跨站请求直接拒绝。 */
 function validateOrigin(req) {
@@ -700,7 +886,100 @@ export function normalize(config) {
   cfg.cloudModel = String(cfg.cloudModel || AUTO).trim() || AUTO;
   cfg.localProvider = String(cfg.localProvider || '').trim();
   cfg.localModel = String(cfg.localModel || '').trim();
+  cfg.researchMode = cfg.researchMode === 'inline' ? 'inline' : 'subagent';
+  cfg.researchSubagentProvider = String(cfg.researchSubagentProvider || 'spawn').trim() || 'spawn';
+  cfg.researchTimeoutMs =
+    Number.isFinite(cfg.researchTimeoutMs) && cfg.researchTimeoutMs > 0 ? Math.floor(cfg.researchTimeoutMs) : 180000;
+  cfg.researchMaxDepth =
+    Number.isFinite(cfg.researchMaxDepth) && cfg.researchMaxDepth >= 0 ? Math.floor(cfg.researchMaxDepth) : 1;
+  cfg.researchPrompt = String(cfg.researchPrompt || '');
   return cfg;
+}
+
+/** 取文本首行并截断，用于子智能体的 label。 */
+export function firstLine(text, max) {
+  const body = String(text || '').replace(/\s+/g, ' ').trim();
+  const limit = Number.isFinite(max) && max > 0 ? Math.floor(max) : 40;
+  return body.length <= limit ? body : `${body.slice(0, limit - 1)}…`;
+}
+
+/** 拼接 ContentBlock[] 里的文本；也接受字符串。 */
+export function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n');
+}
+
+/**
+ * 是否为子会话。
+ *
+ * 子智能体自己也会发 LLM 请求并触发同一套钩子，若不设防会无限套娃。
+ * 三个判据任一成立即视为子会话（三者是不同版本留下的痕迹，都认更稳）。
+ */
+export function isChildSession(agent) {
+  try {
+    const header = agent && agent.session && agent.session.header;
+    if (!header) return false;
+    if (header.parentSession) return true;
+    if (header.origin === 'subagent') return true;
+    if (Number(header.delegationDepth) > 0) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** 构造交给子智能体的调研任务提示词。 */
+export function buildResearchPrompt(text, template) {
+  const question = String(text || '').trim();
+  const custom = String(template || '').trim();
+  if (custom) return custom.split('{question}').join(question);
+  return [
+    '你是一个调研子智能体。请联网调研下面这个请求，然后把结论回传给主会话。',
+    '',
+    '要求：',
+    '1. 先用 web_search / x_search 检索，必要时用 web_fetch 或 read_page 打开原文核实。',
+    '2. 只回传结论，不要复述搜索过程；不要改代码、不要写文件。',
+    '3. 结论里给出关键事实、版本号、链接，并标注哪些点没能证实。',
+    '4. 用中文回答，控制在 800 字以内。',
+    '',
+    '请求原文：',
+    question
+  ].join('\n');
+}
+
+/**
+ * 构造回注主会话的调研结论消息。
+ *
+ * 不能 import createUserMessage（@deepseek-ai/dsh-llm 不在 profile 依赖里），
+ * 所以这里手搓等价结构：id 用 uuid，source 用 plugin + notice。
+ */
+export function buildResearchMessage(question, answer, target, stopReason) {
+  const route = target ? `${target.provider}/${target.model}` : 'cloud';
+  const summary = `云端子智能体调研结论（${route}，${stopReason}）`;
+  return {
+    id: globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function' ? globalThis.crypto.randomUUID() : `mr-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    role: 'user',
+    content: [
+      {
+        type: 'text',
+        text: [
+          `【云端子智能体调研结论】模型 ${route}，结束原因 ${stopReason}。`,
+          '主会话仍在本地模型上，可直接基于以下结论继续；除非需要追问细节，不必重复检索。',
+          '',
+          '调研问题：',
+          firstLine(question, 200),
+          '',
+          '结论：',
+          String(answer || '').trim()
+        ].join('\n')
+      }
+    ],
+    source: { kind: 'plugin', plugin: 'model-router', form: 'notice', summary }
+  };
 }
 
 export function normMode(value) {
@@ -806,7 +1085,9 @@ function renderStatus(value) {
     `model-router: enabled=${value.enabled}  mode=${value.mode}  当前会话=${value.route}`,
     `  本地: ${value.local?.provider}/${value.local?.model}`,
     `  云端: ${value.cloud?.provider}/${value.cloud?.model}${value.coolingDown ? '  (冷却中)' : ''}`,
+    `  调研: ${value.researchMode === 'inline' ? '主会话自己切云端' : `云端子智能体 (${value.researchSubagentProvider || 'spawn'})`}`,
     `  已处理 ${stats.requests ?? 0} 次请求：切云端 ${stats.routedCloud ?? 0} 次，留本地 ${stats.routedLocal ?? 0} 次，云端失败 ${stats.cloudFailures ?? 0} 次`,
+    `  调研外包 ${stats.researchSpawns ?? 0} 次：成功 ${stats.researchOk ?? 0}，失败 ${stats.researchFailed ?? 0}，空结论 ${stats.researchEmpty ?? 0}`,
     `  最近一次: ${stats.lastRoute ?? '-'} (${stats.lastReason ?? '-'})`,
     `  触发词 ${value.researchKeywordCount ?? 0} 个，研究类工具 ${value.researchToolCount ?? 0} 个`
   ];
